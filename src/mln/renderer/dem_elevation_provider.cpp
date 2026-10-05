@@ -7,6 +7,7 @@
 #include <mln/tile/raster_dem_tile.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace mln {
@@ -56,7 +57,7 @@ std::optional<Range<double>> DEMElevationProvider::getTileElevationRange(const C
     // The tile's own DEM, or failing that the deepest loaded ancestor: an ancestor's
     // range covers this tile's area, so it stays conservative, just looser.
     const DEMData* best = nullptr;
-    uint8_t bestZoom = 0;
+    CanonicalTileID bestId{0, 0, 0};
     for (const auto& renderTile : *renderTiles) {
         const auto& tile = renderTile.getTile();
         if (tile.kind != Tile::Kind::RasterDEM) {
@@ -64,7 +65,7 @@ std::optional<Range<double>> DEMElevationProvider::getTileElevationRange(const C
         }
         const auto& candidate = renderTile.id.canonical;
         const bool covers = candidate == id || id.isChildOf(candidate);
-        if (!covers || (best && candidate.z <= bestZoom)) {
+        if (!covers || (best && candidate.z <= bestId.z)) {
             continue;
         }
         const auto* demTile = static_cast<const RasterDEMTile*>(&tile);
@@ -73,7 +74,7 @@ std::optional<Range<double>> DEMElevationProvider::getTileElevationRange(const C
             continue;
         }
         best = &bucket->getDEMData();
-        bestZoom = candidate.z;
+        bestId = candidate;
         if (candidate == id) {
             break; // exact match; nothing looser can improve on it
         }
@@ -88,7 +89,20 @@ std::optional<Range<double>> DEMElevationProvider::getTileElevationRange(const C
 
     // Exaggeration is applied to the mesh in the terrain vertex shader, so the bounds
     // have to carry it too, or an exaggerated peak would still be culled.
-    return Range<double>{best->getMinElevation() * exaggeration, best->getMaxElevation() * exaggeration};
+    // Only the part of the DEM under this tile: an ancestor's whole range turns every
+    // deep tile into a column as tall as the highest peak anywhere in the DEM tile,
+    // which reaches into the frustum far past the visible ground and inflates the cover.
+    // The rectangle grows by a pixel each way because the mesh interpolates between
+    // samples, so terrain just outside the footprint still shapes it.
+    const double scale = std::exp2(id.z - bestId.z);
+    const double pixelsPerTile = best->dim / scale;
+    const double left = (id.x - bestId.x * scale) * pixelsPerTile;
+    const double top = (id.y - bestId.y * scale) * pixelsPerTile;
+    const Range<int32_t> range = best->getElevationRange(static_cast<int32_t>(std::floor(left)) - 1,
+                                                         static_cast<int32_t>(std::floor(top)) - 1,
+                                                         static_cast<int32_t>(std::ceil(left + pixelsPerTile)),
+                                                         static_cast<int32_t>(std::ceil(top + pixelsPerTile)));
+    return Range<double>{range.min * exaggeration, range.max * exaggeration};
 }
 
 } // namespace mln

@@ -166,3 +166,34 @@ TEST(DEMData, TerrariumNoData) {
     DEMData mapbox(image, Tileset::RasterEncoding::Mapbox);
     EXPECT_EQ(mapbox.get(0, 0), -10000);
 };
+
+TEST(DEMData, ElevationRangeOfASubRectangle) {
+    // Flat at 0 m bar two terrarium peaks: 256 m at (1, 1) and 2304 m at (13, 13).
+    PremultipliedImage image({16, 16});
+    for (size_t i = 3; i < image.bytes(); i += 4) {
+        image.data[i] = 1;
+    }
+    for (size_t i = 0; i < image.bytes(); i += 4) {
+        image.data[i] = 128; // 128 * 256 - 32768 = 0 m
+    }
+    image.data[(1 * 16 + 1) * 4] = 129;
+    image.data[(13 * 16 + 13) * 4] = 137;
+
+    DEMData dem(image, Tileset::RasterEncoding::Terrarium);
+    EXPECT_EQ(dem.getMinElevation(), 0);
+    EXPECT_EQ(dem.getMaxElevation(), 2304);
+    EXPECT_EQ(dem.getElevationRange(0, 0, 15, 15), (Range<int32_t>{0, 2304}));
+
+    // The quadrant holding only the low peak never sees the high one.
+    EXPECT_EQ(dem.getElevationRange(0, 0, 7, 7), (Range<int32_t>{0, 256}));
+    // Nor does a quadrant holding neither.
+    EXPECT_EQ(dem.getElevationRange(8, 0, 15, 7), (Range<int32_t>{0, 0}));
+    // The high peak's quadrant holds it, and a rectangle hanging off the tile is clamped.
+    EXPECT_EQ(dem.getElevationRange(8, 8, 15, 15), (Range<int32_t>{0, 2304}));
+    EXPECT_EQ(dem.getElevationRange(12, 12, 40, 40), (Range<int32_t>{0, 2304}));
+    // A single pixel reads its own height; the pyramid is conservative, so it may
+    // widen to its 4x4 cell, never narrow below the pixels asked for.
+    const Range<int32_t> pixel = dem.getElevationRange(13, 13, 13, 13);
+    EXPECT_EQ(pixel.min, 0);
+    EXPECT_EQ(pixel.max, 2304);
+};

@@ -2,6 +2,7 @@
 #include <mln/math/clamp.hpp>
 
 #include <algorithm>
+#include <limits>
 
 namespace mln {
 
@@ -50,22 +51,83 @@ DEMData::DEMData(const PremultipliedImage& _image, Tileset::RasterEncoding _enco
         }
     }
 
-    // The elevation range of the tile, used to give the tile a height when testing
-    // it against the view frustum (see util::tileCover): terrain rising towards the
-    // camera is visible from further away than its flat footprint suggests. Computed
-    // once here, on the worker thread that decodes the tile, rather than per frame.
-    // The border is excluded: it is a copy of the edge pixels until neighbouring
-    // tiles backfill it, so it holds no elevation this tile does not already have.
-    if (dim > 0) {
-        minElevation = maxElevation = get(0, 0);
-        for (int32_t y = 0; y < dim; y++) {
-            for (int32_t x = 0; x < dim; x++) {
-                const int32_t value = get(x, y);
-                minElevation = std::min(minElevation, value);
-                maxElevation = std::max(maxElevation, value);
-            }
+    // The elevation range of the tile, and of its sub-rectangles, gives a tile a height when
+    // testing it against the view frustum (see util::tileCover): terrain rising towards the
+    // camera is visible from further away than its flat footprint suggests. Computed once
+    // here, on the worker thread that decodes the tile, rather than per frame. The border is
+    // excluded: it is a copy of the edge pixels until neighbouring tiles backfill it, so it
+    // holds no elevation this tile does not already have.
+    buildMinMaxPyramid();
+}
+
+void DEMData::buildMinMaxPyramid() {
+    if (dim <= 0) {
+        return;
+    }
+    constexpr int32_t finestCellSize = 4;
+    MinMaxLevel level{finestCellSize, (dim + finestCellSize - 1) / finestCellSize, {}, {}};
+    level.min.assign(static_cast<size_t>(level.cells) * level.cells, std::numeric_limits<int32_t>::max());
+    level.max.assign(level.min.size(), std::numeric_limits<int32_t>::lowest());
+    for (int32_t y = 0; y < dim; y++) {
+        for (int32_t x = 0; x < dim; x++) {
+            const int32_t value = get(x, y);
+            const size_t cell = static_cast<size_t>(y / finestCellSize) * level.cells + x / finestCellSize;
+            level.min[cell] = std::min(level.min[cell], value);
+            level.max[cell] = std::max(level.max[cell], value);
         }
     }
+    minMaxPyramid.push_back(std::move(level));
+
+    while (minMaxPyramid.back().cells > 1) {
+        const MinMaxLevel& fine = minMaxPyramid.back();
+        MinMaxLevel coarse{fine.cellSize * 2, (fine.cells + 1) / 2, {}, {}};
+        coarse.min.assign(static_cast<size_t>(coarse.cells) * coarse.cells, std::numeric_limits<int32_t>::max());
+        coarse.max.assign(coarse.min.size(), std::numeric_limits<int32_t>::lowest());
+        for (int32_t y = 0; y < fine.cells; y++) {
+            for (int32_t x = 0; x < fine.cells; x++) {
+                const size_t from = static_cast<size_t>(y) * fine.cells + x;
+                const size_t to = static_cast<size_t>(y / 2) * coarse.cells + x / 2;
+                coarse.min[to] = std::min(coarse.min[to], fine.min[from]);
+                coarse.max[to] = std::max(coarse.max[to], fine.max[from]);
+            }
+        }
+        minMaxPyramid.push_back(std::move(coarse));
+    }
+
+    minElevation = minMaxPyramid.back().min[0];
+    maxElevation = minMaxPyramid.back().max[0];
+}
+
+Range<int32_t> DEMData::getElevationRange(int32_t x0, int32_t y0, int32_t x1, int32_t y1) const {
+    if (minMaxPyramid.empty()) {
+        return {minElevation, maxElevation};
+    }
+    x0 = std::clamp(x0, 0, dim - 1);
+    y0 = std::clamp(y0, 0, dim - 1);
+    x1 = std::clamp(x1, x0, dim - 1);
+    y1 = std::clamp(y1, y0, dim - 1);
+
+    // The finest level whose cells are at least half the rectangle wide, so the
+    // rectangle touches at most three cells per axis.
+    const int32_t extent = std::max(x1 - x0, y1 - y0) + 1;
+    const MinMaxLevel* level = &minMaxPyramid.back();
+    for (const auto& candidate : minMaxPyramid) {
+        if (candidate.cellSize * 2 >= extent) {
+            level = &candidate;
+            break;
+        }
+    }
+
+    int32_t lo = std::numeric_limits<int32_t>::max();
+    int32_t hi = std::numeric_limits<int32_t>::lowest();
+    for (int32_t cy = y0 / level->cellSize; cy <= y1 / level->cellSize; cy++) {
+        for (int32_t cx = x0 / level->cellSize; cx <= x1 / level->cellSize; cx++) {
+            const size_t cell = static_cast<size_t>(cy) * level->cells + cx;
+            lo = std::min(lo, level->min[cell]);
+            hi = std::max(hi, level->max[cell]);
+        }
+    }
+    return {lo, hi};
 }
 
 // This function takes the DEMData from a neighboring tile and backfills the
