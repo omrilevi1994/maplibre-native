@@ -138,7 +138,11 @@ std::set<UnwrappedTileID> RenderTerrain::computeMeshCover(
     // undersamples the DEM, aliasing the relief into waves on the fixed 128x128 mesh. Still the
     // elevation-aware ideal cover from the view, not the DEM's loaded tile set.
     const uint16_t terrainCoverTileSize = demSource->getTileSize();
-    const Range<uint8_t> zoomRange{0, demSource->getMaxZoom()};
+    // Up to the map's max zoom, not the DEM's: past the DEM's max zoom the mesh keeps
+    // subdividing on overscaled DEM tiles, so the drape targets keep their ground
+    // resolution instead of one 1024px target stretching over a whole DEM max-zoom tile.
+    const Range<uint8_t> zoomRange{
+        0, static_cast<uint8_t>(std::max<double>(demSource->getMaxZoom(), std::ceil(state.getMaxZoom())))};
 
     // LOD parameters from the frame drive the same near-high/far-low zoom
     // selection every other source uses, so the near field drapes at a higher
