@@ -822,6 +822,38 @@ on; it does not stop the cover descending from z0. An earlier note here read "8 
 wrong - a truncated pipe, not a shorter list.
 
 
+### Elevated tile cover and centre clamp fixes (2026-10-05)
+
+Four faults found driving the branch on Android (OpenGL, Terrarium DEM to z15, centre
+clamped to the ground), each pinned by a unit test:
+
+- **Box heights were in the wrong units.** `util::tileCover` / `frustumCull` scaled DEM
+  heights by the ground metres-to-tile-units factor, but `Frustum::fromInvProjMatrix`
+  scales its corners by `numTiles / worldSize` on every axis and the projection's z is in
+  metres, so box and frustum disagreed by `pixelsPerMeter`. From about z16 a plateau's box
+  left the frustum, the DEM root tile was culled and every source's cover emptied: the map
+  showed only its background, and the clamped centre oscillated between the plateau height
+  and 0 m. `TileCover.ElevatedPlateauCoversTheSameTilesAsFlatGround` (11 vs 67 tiles before).
+- **A tile's height came from the whole ancestor DEM tile.** A z18 tile under a z12 DEM
+  took the range of the entire z12 tile, so every deep tile was a column as tall as the
+  area's highest peak and reached into the frustum far past the visible ground: 115 tiles
+  per source tilted where flat ground gives 24, and `TilePyramid::update` took the render
+  thread (96% on a device). `DEMData` keeps a min/max pyramid; `getTileElevationRange`
+  reads only the pixels under the tile, grown by one. 21 tiles after.
+  `DEMData.ElevationRangeOfASubRectangle`.
+- **The mesh cap ran after the drape pool was built.** `Renderer::Impl` allocates drape
+  targets from `computeMeshCover`, which was uncapped; `update()` capped only what it
+  meshed. `capMeshTiles` now applies to both (an emulator reached 112 GB before).
+- **The clamp ended animations.** Each centre-elevation report did a `jumpTo`, and
+  `Transform::startTransition` finishes the running transition first, so a fly-to over
+  terrain stopped in its first frames. A report during a transition is kept and applied
+  after it (`pendingCenterElevation`); dropping it would lose the height, since the renderer
+  reports only changes. `TerrainCamera.ClampLeavesARunningAnimationToFinish`.
+
+Related work in flight: #4711 anchors pans and anchored zooms on the plane at the centre's
+altitude (`screenCoordinateToTileCoordinate` aimed at z = 0, which with a raised centre
+moved the map by altitude * tan(pitch) per drag step); it is not repeated here.
+
 ### Convergence with maplibre-gl-js (ask before doing)
 
 Places where the native implementation reaches gl-js behavior through
