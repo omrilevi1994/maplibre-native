@@ -4,6 +4,7 @@
 #include <mln/math/angles.hpp>
 
 #include <algorithm>
+#include <set>
 #include <cstdlib> /* srand, rand */
 #include <ctime>   /* time */
 #include <gtest/gtest.h>
@@ -52,6 +53,64 @@ TEST(TileCover, Pitch) {
     params.tileLodMode = TileLodMode::Distance;
     EXPECT_EQ((std::vector<OverscaledTileID>{{2, 1, 2}, {2, 2, 2}, {2, 1, 1}, {2, 2, 1}}),
               util::tileCover(params, 2, zoomRange));
+}
+
+namespace {
+// Every tile sits on a plateau of one height: the view of it is the flat-ground view
+// lifted by that height, so it must cover the same tiles as flat ground does.
+class PlateauElevation : public util::TileElevationProvider {
+public:
+    explicit PlateauElevation(double meters_)
+        : meters(meters_) {}
+    std::optional<Range<double>> getTileElevationRange(const CanonicalTileID&) const override {
+        return Range<double>{meters, meters};
+    }
+
+private:
+    double meters;
+};
+} // namespace
+
+TEST(TileCover, ElevatedPlateauCoversTheSameTilesAsFlatGround) {
+    // The same camera, once over flat ground at sea level and once over a 700 m plateau
+    // with the centre clamped onto it: the view of the surface is identical, so the cover
+    // must be too.
+    Transform transform;
+    transform.resize({1080, 2400});
+    const CameraOptions camera =
+        CameraOptions().withCenter(LatLng{31.774144, 35.226362}).withZoom(17.0).withBearing(49.0).withPitch(60.0);
+    const Range<uint8_t> toZ17(0, 17);
+
+    transform.jumpTo(CameraOptions(camera).withCenterAltitude(0.0));
+    const auto flat = util::tileCover({transform.getState()}, 17, toZ17);
+    ASSERT_FALSE(flat.empty());
+
+    // Scaling the plateau height by the ground meters-per-pixel instead of the frustum's
+    // own meters-to-tile-units factor lifted the box out of the frustum, so the root tile
+    // and everything under it was culled: no DEM, no terrain, a blank map.
+    transform.jumpTo(CameraOptions(camera).withCenterAltitude(700.0));
+    const PlateauElevation plateau(700.0);
+    util::TileCoverParameters params{transform.getState()};
+    params.elevationProvider = &plateau;
+    const auto elevated = util::tileCover(params, 17, toZ17);
+
+    // Nothing the flat view shows may be culled, and the elevated box's 3D frustum test may
+    // only add tiles along the flat cover's edge, where it is conservative.
+    const std::set<OverscaledTileID> flatSet(flat.begin(), flat.end());
+    const std::set<OverscaledTileID> elevatedSet(elevated.begin(), elevated.end());
+    for (const auto& tile : flatSet) {
+        EXPECT_TRUE(elevatedSet.count(tile)) << "culled " << util::toString(tile);
+    }
+    for (const auto& tile : elevatedSet) {
+        if (flatSet.count(tile)) continue;
+        const bool bordersFlatCover = std::any_of(
+            flatSet.begin(), flatSet.end(), [&](const OverscaledTileID& flatTile) {
+                return flatTile.canonical.z == tile.canonical.z &&
+                       std::abs(int64_t(flatTile.canonical.x) - int64_t(tile.canonical.x)) <= 1 &&
+                       std::abs(int64_t(flatTile.canonical.y) - int64_t(tile.canonical.y)) <= 1;
+            });
+        EXPECT_TRUE(bordersFlatCover) << "added away from the flat cover: " << util::toString(tile);
+    }
 }
 
 TEST(TileCover, PitchIssue15442) {
