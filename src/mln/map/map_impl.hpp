@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <mln/annotation/annotation_manager.hpp>
 #include <mln/map/map.hpp>
 #include <mln/map/map_observer.hpp>
@@ -123,6 +125,9 @@ public:
     /// pans. Opt in with Map::setCenterClampedToGround until it is applied during render
     /// setup instead, the way GL JS's recalculateZoomAndCenter is.
     bool centerClampedToGround = false;
+    // A clamp report that arrived while an animation was running, applied once it ends.
+    std::optional<double> pendingCenterElevation;
+    bool clampCenterTo(double elevationMeters);
     bool debugAboveGroundLog = false;
 };
 

@@ -114,6 +114,14 @@ void Map::Impl::onUpdate() {
 
     transform.updateTransitions(timePoint);
 
+    if (pendingCenterElevation && !transform.inTransition()) {
+        const double elevationMeters = *pendingCenterElevation;
+        pendingCenterElevation.reset();
+        if (centerClampedToGround) {
+            clampCenterTo(elevationMeters);
+        }
+    }
+
     std::optional<Immutable<style::Terrain::Impl>> terrainImpl;
     if (auto* terrain = style->impl->getTerrain()) {
         terrainImpl = terrain->impl;
@@ -324,16 +332,29 @@ void Map::Impl::onTerrainCenterElevationChanged(double elevationMeters) {
     if (!centerClampedToGround) {
         return;
     }
+    // A running animation owns the camera: a jumpTo now would start a new (instant)
+    // transition, which finishes the running one where it stands. The renderer reports a
+    // height only when it changes, so the report is kept and applied when the animation ends.
+    if (transform.inTransition()) {
+        pendingCenterElevation = elevationMeters;
+        return;
+    }
+    if (clampCenterTo(elevationMeters)) {
+        onUpdate();
+    }
+}
+
+bool Map::Impl::clampCenterTo(double elevationMeters) {
     // Sub-metre differences are the terrain cover shifting under a camera that just moved,
     // not the ground actually changing height; acting on them would chase itself.
     constexpr double minimumChangeMeters = 0.5;
     if (std::abs(transform.getState().getCenterAltitude() - elevationMeters) < minimumChangeMeters) {
-        return;
+        return false;
     }
     // Raising the centre onto the terrain moves the orbit plane, not the centre's lng/lat,
     // so this settles rather than feeding back into the next frame's sample.
     transform.jumpTo(CameraOptions().withCenterAltitude(elevationMeters));
-    onUpdate();
+    return true;
 }
 
 void Map::Impl::jumpTo(const CameraOptions& camera) {
