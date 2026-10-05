@@ -77,6 +77,42 @@ DEMSubTileOffset demSubTileOffset(const CanonicalTileID& child, const CanonicalT
             static_cast<float>(child.y - (ancestor.y << dz))};
 }
 
+// Cap the mesh tile count: keep those nearest the map center, drop the farthest
+// (the horizon tiles a high tilt pulls in). Everything downstream - drape
+// targets, re-renders, depth draws - scales with this count.
+// Per-mode cap (TerrainLoadBudget::maxMeshTiles): Quality keeps a generous cap so terrain
+// render distance stays long; Balanced/Performance trade distance for frame time.
+void capMeshTiles(std::set<UnwrappedTileID>& tiles,
+                  const TransformState& state,
+                  const std::shared_ptr<UpdateParameters>& updateParameters) {
+    const size_t maxMeshTiles = updateParameters ? terrainLoadBudget(updateParameters->terrainLoadMode).maxMeshTiles
+                                                 : 0;
+    if (maxMeshTiles == 0 || tiles.size() <= maxMeshTiles) {
+        return;
+    }
+    // Map center in normalized web-mercator [0,1] (standard projection)
+    const LatLng center = state.getLatLng();
+    const double cx = center.longitude() / 360.0 + 0.5;
+    const double latRad = util::deg2rad(center.latitude());
+    const double cy = 0.5 - std::log(std::tan(M_PI / 4.0 + latRad / 2.0)) / (2.0 * M_PI);
+
+    const auto tileDist2 = [&](const UnwrappedTileID& id) {
+        const double scale = static_cast<double>(1u << id.canonical.z);
+        const double tx = (static_cast<double>(id.canonical.x) + 0.5) / scale + id.wrap;
+        const double ty = (static_cast<double>(id.canonical.y) + 0.5) / scale;
+        const double dx = tx - cx;
+        const double dy = ty - cy;
+        return dx * dx + dy * dy;
+    };
+
+    std::vector<UnwrappedTileID> sorted(tiles.begin(), tiles.end());
+    std::partial_sort(sorted.begin(),
+                      sorted.begin() + static_cast<std::ptrdiff_t>(maxMeshTiles),
+                      sorted.end(),
+                      [&](const UnwrappedTileID& a, const UnwrappedTileID& b) { return tileDist2(a) < tileDist2(b); });
+    tiles = std::set<UnwrappedTileID>(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(maxMeshTiles));
+}
+
 } // namespace
 
 RenderTerrain::RenderTerrain(Immutable<style::Terrain::Impl> impl_)
@@ -164,6 +200,10 @@ std::set<UnwrappedTileID> RenderTerrain::computeMeshCover(
     if (dilated.size() != out.size()) {
         out = util::frustumCull(coverParams, dilated);
     }
+
+    // The drape-target pool is allocated from this cover, so the cap applies here, not only
+    // in update(): capping only there still gave every uncapped tile a drape target.
+    capMeshTiles(out, state, updateParameters);
     return out;
 }
 
@@ -284,38 +324,7 @@ void RenderTerrain::update(RenderOrchestrator& orchestrator,
                                                          : computeMeshCover(state, updateParameters);
     frameMeshCover.reset();
 
-    // Cap the mesh tile count: keep those nearest the map center, drop the farthest
-    // (the horizon tiles a high tilt pulls in). Everything downstream - drape
-    // targets, re-renders, depth draws - scales with this count.
-    // Per-mode cap (TerrainLoadBudget::maxMeshTiles): Quality keeps a generous cap so terrain
-    // render distance stays long; Balanced/Performance trade distance for frame time.
-    const size_t maxMeshTiles = updateParameters ? terrainLoadBudget(updateParameters->terrainLoadMode).maxMeshTiles
-                                                 : 0;
-    if (maxMeshTiles > 0 && meshTiles.size() > maxMeshTiles) {
-        // Map center in normalized web-mercator [0,1] (standard projection)
-        const LatLng center = state.getLatLng();
-        const double cx = center.longitude() / 360.0 + 0.5;
-        const double latRad = util::deg2rad(center.latitude());
-        const double cy = 0.5 - std::log(std::tan(M_PI / 4.0 + latRad / 2.0)) / (2.0 * M_PI);
-
-        const auto tileDist2 = [&](const UnwrappedTileID& id) {
-            const double scale = static_cast<double>(1u << id.canonical.z);
-            const double tx = (static_cast<double>(id.canonical.x) + 0.5) / scale + id.wrap;
-            const double ty = (static_cast<double>(id.canonical.y) + 0.5) / scale;
-            const double dx = tx - cx;
-            const double dy = ty - cy;
-            return dx * dx + dy * dy;
-        };
-
-        std::vector<UnwrappedTileID> sorted(meshTiles.begin(), meshTiles.end());
-        std::partial_sort(
-            sorted.begin(),
-            sorted.begin() + static_cast<std::ptrdiff_t>(maxMeshTiles),
-            sorted.end(),
-            [&](const UnwrappedTileID& a, const UnwrappedTileID& b) { return tileDist2(a) < tileDist2(b); });
-        meshTiles = std::set<UnwrappedTileID>(sorted.begin(),
-                                              sorted.begin() + static_cast<std::ptrdiff_t>(maxMeshTiles));
-    }
+    capMeshTiles(meshTiles, state, updateParameters);
 
     // Drop drawables and cached DEM textures for tiles that left the mesh tile
     // set, keeping everything else intact between frames
